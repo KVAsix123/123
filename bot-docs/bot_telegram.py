@@ -23,6 +23,7 @@
 КОМАНДЫ
   (текст или фото)   — разобрать данные клиента
   /show   — показать текущий JSON
+  /edit   — выбрать поле из списка и вписать новое значение
   /fix поле=значение — поправить поле
   /reset  — сбросить
   /status — что настроено
@@ -50,11 +51,37 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "bot_config.json")
 PHOTO_WAIT = 2.5          # сек: столько ждём остальные фото альбома
 MAX_PHOTOS = 6
 
-try:
-    from dogovor_core import TEMPLATE, build_contract
-    CAN_BUILD = os.path.exists(TEMPLATE)
-except Exception:
-    build_contract, TEMPLATE, CAN_BUILD = None, "", False
+# Модуль сборки договора грузим лениво и запоминаем причину неудачи. Раньше
+# ошибка импорта (чаще всего — не установлен python-docx в том Python, которым
+# запускается бот) глоталась молча, и кнопка «Сформировать договор» просто
+# пропадала без объяснений.
+PIP_NAMES = {"docx": "python-docx", "docx2pdf": "docx2pdf", "lxml": "lxml"}
+TEMPLATE = os.path.join(SCRIPT_DIR, "template11.docx")
+build_contract = None
+BUILD_ERR = ""
+
+
+def ensure_builder():
+    """Пробует подключить dogovor_core. Возвращает '' или текст причины."""
+    global build_contract, TEMPLATE, BUILD_ERR
+    if build_contract is None:
+        try:
+            from dogovor_core import TEMPLATE as _tpl, build_contract as _build
+            build_contract, TEMPLATE = _build, _tpl
+        except ImportError as e:
+            mod = (getattr(e, "name", "") or "").split(".")[0]
+            pkg = PIP_NAMES.get(mod, mod or "?")
+            BUILD_ERR = (f"не установлена библиотека {mod or e} — выполните "
+                         f"«{sys.executable} -m pip install {pkg}» и перезапустите бота")
+            return BUILD_ERR
+        except Exception as e:
+            BUILD_ERR = f"не загрузился dogovor_core.py: {e}"
+            return BUILD_ERR
+    BUILD_ERR = "" if os.path.exists(TEMPLATE) else f"не найден шаблон {TEMPLATE}"
+    return BUILD_ERR
+
+
+ensure_builder()
 
 
 def load_config():
@@ -78,6 +105,15 @@ API = f"https://api.telegram.org/bot{CFG['token']}"
 SESSIONS = {}      # chat_id -> разобранный словарь
 PHOTOBUF = {}      # chat_id -> {'images': [(bytes, mime)], 'caption': str, 'ts': float}
 SEEN_TEXT = {}     # chat_id -> последний распознанный с фото текст (для /raw)
+SOURCES = {}       # chat_id -> {поле: приоритет источника}
+EDITING = {}       # chat_id -> поле, для которого ждём новое значение
+
+# Чем надёжнее источник, тем выше приоритет. Данные из паспорта (особенно
+# прописку со штампа) не перетирает текст, присланный позже; ручную правку
+# не перетирает ничего.
+PRIO_TEXT, PRIO_PASSPORT, PRIO_MANUAL = 1, 2, 3
+PASSPORT_FIELDS = ("full_name", "passport_series", "passport_number",
+                   "passport_issued_by", "registration_address")
 
 
 # --- транспорт --------------------------------------------------------------
@@ -93,6 +129,12 @@ def send(chat_id, text, keyboard=None):
     if keyboard:
         params["reply_markup"] = {"inline_keyboard": keyboard}
     return api("sendMessage", **params)
+
+
+def edit_keyboard(chat_id, message_id, keyboard):
+    """Меняет кнопки под уже отправленным сообщением, не плодя новых."""
+    return api("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
+               reply_markup={"inline_keyboard": keyboard})
 
 
 def send_file(chat_id, path, caption=""):
@@ -115,7 +157,7 @@ def download(file_id):
 
 # --- ответы -----------------------------------------------------------------
 
-def render_reply(data, issues, source=""):
+def render_reply(data, issues, source="", chat_id=None):
     payload = {k: data.get(k, "") for k in FIELDS}
     body = json.dumps(payload, ensure_ascii=False, indent=2)
     filled = sum(1 for k in FIELDS if data.get(k))
@@ -135,22 +177,92 @@ def render_reply(data, issues, source=""):
             for i in warns)
     if not errs and not warns:
         head += "\nЗамечаний нет."
-    return f"{head}\n\n<pre>{html.escape(body)}</pre>\n\nПоправить: <code>/fix поле=значение</code>"
+
+    src = SOURCES.get(chat_id, {}) if chat_id is not None else {}
+    if any(src.get(f) == PRIO_PASSPORT for f in PASSPORT_FIELDS):
+        head += "\n\n🛂 Паспортные данные и прописка взяты из паспорта — текст их не перезапишет."
+
+    return (f"{head}\n\n<pre>{html.escape(body)}</pre>\n\n"
+            "<b>Всё верно?</b> Тогда «📄 Сформировать договор».\n"
+            "Нужно что-то поправить — «✏️ Редактировать» и выберите поле.")
 
 
 def keyboard_for(data):
     rows = []
-    if CAN_BUILD and data.get("full_name"):
+    if data and any(data.get(f) for f in FIELDS):
         rows.append([{"text": "📄 Сформировать договор", "callback_data": "build"}])
+        rows.append([{"text": "✏️ Редактировать", "callback_data": "edit"}])
     rows.append([{"text": "🗑 Сбросить", "callback_data": "reset"}])
     return rows
 
 
-def merge_into_session(chat_id, new):
-    data = SESSIONS.get(chat_id, {})
-    data.update({k: v for k, v in new.items() if v})
-    SESSIONS[chat_id] = data
+def _short(val, limit=30):
+    val = str(val or "").strip()
+    return val if len(val) <= limit else val[:limit - 1] + "…"
+
+
+def fields_keyboard(data):
+    """Список полей для правки: на кнопке — название и текущее значение."""
+    rows = []
+    for f in FIELDS:
+        mark = "" if data.get(f) else "⚠️ "
+        text = f"{mark}{FIELD_LABELS[f]}: {_short(data.get(f)) or '—'}"
+        rows.append([{"text": text, "callback_data": "edit:" + f}])
+    rows.append([{"text": "⬅️ Назад", "callback_data": "back"}])
+    return rows
+
+
+def merge_into_session(chat_id, new, from_passport=False):
+    """
+    Добавляет свежие данные в карточку клиента с учётом приоритета источника:
+    поле с более надёжным источником не перезаписывается менее надёжным.
+    """
+    data = SESSIONS.setdefault(chat_id, {})
+    src = SOURCES.setdefault(chat_id, {})
+    for k, v in new.items():
+        if not v:
+            continue
+        if k not in FIELDS:            # служебные пометки вроде _mrz_checked
+            data[k] = v
+            continue
+        prio = PRIO_PASSPORT if (from_passport and k in PASSPORT_FIELDS) else PRIO_TEXT
+        if data.get(k) and src.get(k, 0) > prio:
+            continue
+        data[k] = v
+        src[k] = prio
+    if data.get("registration_address") and src.get("registration_address", 0) >= PRIO_PASSPORT:
+        data.pop("_addr_garbled", None)
     return data
+
+
+def looks_like_passport(fresh):
+    """Пачка данных пришла со страниц паспорта, а не, скажем, со скрина банка."""
+    return bool(fresh.get("passport_number") or fresh.get("passport_series")
+                or fresh.get("_mrz_checked"))
+
+
+def clear_session(chat_id):
+    for store in (SESSIONS, SOURCES, EDITING, PHOTOBUF, SEEN_TEXT):
+        store.pop(chat_id, None)
+
+
+def apply_edit(chat_id, field, value):
+    """Ручная правка поля: высший приоритет, дальше её ничто не перезапишет."""
+    data = SESSIONS.get(chat_id)
+    if not data:
+        send(chat_id, "Карточка клиента пуста — сначала пришлите данные.")
+        return
+    data[field] = value.strip()
+    data = normalize(data)
+    if field == "registration_address":
+        data.pop("_addr_garbled", None)
+    if field == "bank_account":
+        data.pop("_card_seen", None)
+    SESSIONS[chat_id] = data
+    SOURCES.setdefault(chat_id, {})[field] = PRIO_MANUAL
+    what = "очищено" if not data.get(field) else "обновлено"
+    send(chat_id, f"✅ {html.escape(FIELD_LABELS[field])} — {what}.\n\n"
+         + render_reply(data, validate(data), chat_id=chat_id), keyboard_for(data))
 
 
 HELP = (
@@ -166,7 +278,8 @@ HELP = (
     "<b>Команды</b>\n"
     "/show — текущий JSON\n"
     "/raw — что именно увидел OCR на фото\n"
-    "/fix поле=значение — поправить поле\n"
+    "/edit — выбрать поле из списка и поправить\n"
+    "/fix поле=значение — поправить поле одной строкой\n"
     "/reset — сбросить\n"
     "/status — что настроено\n"
     "/id — мой Telegram ID"
@@ -301,14 +414,14 @@ def flush_photos():
 
         if raw_text:
             SEEN_TEXT[chat_id] = raw_text
-        data = merge_into_session(chat_id, fresh)
+        data = merge_into_session(chat_id, fresh, from_passport=looks_like_passport(fresh))
         tail = ""
         if note:
             tail += "\n\n✅ " + html.escape(note)
         if used == "local":
             tail += "\n\nСырой текст распознавания: <code>/raw</code>"
         source = f"по {n} фото" + (", облако" if used == "cloud" else "")
-        send(chat_id, render_reply(data, validate(data), source) + tail, keyboard_for(data))
+        send(chat_id, render_reply(data, validate(data), source, chat_id) + tail, keyboard_for(data))
 
 
 # --- команды ----------------------------------------------------------------
@@ -334,14 +447,13 @@ def handle_text(chat_id, user_id, text):
             photo_line = "нет — " + html.escape(name)
         lines = [f"Чтение фото: {photo_line}",
                  f"Облачный ИИ для текста: {html.escape(state)}",
-                 f"Шаблон договора: {'найден' if CAN_BUILD else 'не найден'}",
+                 "Договор: " + ("готов к сборке" if not ensure_builder()
+                                  else "не соберётся — " + html.escape(BUILD_ERR)),
                  "Разбор текста регулярками: всегда работает"]
         send(chat_id, "\n".join(lines))
         return
     if text == "/reset":
-        SESSIONS.pop(chat_id, None)
-        PHOTOBUF.pop(chat_id, None)
-        SEEN_TEXT.pop(chat_id, None)
+        clear_session(chat_id)
         send(chat_id, "Сброшено. Присылайте следующего клиента.")
         return
     if text == "/raw":
@@ -357,7 +469,7 @@ def handle_text(chat_id, user_id, text):
         if not data:
             send(chat_id, "Пока ничего не разобрано.")
         else:
-            send(chat_id, render_reply(data, validate(data)), keyboard_for(data))
+            send(chat_id, render_reply(data, validate(data), chat_id=chat_id), keyboard_for(data))
         return
     if text.startswith("/fix"):
         data = SESSIONS.get(chat_id)
@@ -375,11 +487,14 @@ def handle_text(chat_id, user_id, text):
             send(chat_id, f"Нет поля <code>{html.escape(key)}</code>. Доступны: "
                           + ", ".join(f"<code>{f}</code>" for f in FIELDS))
             return
-        from parser_klienta import normalize
-        data[key] = val
-        data = normalize(data)
-        SESSIONS[chat_id] = data
-        send(chat_id, render_reply(data, validate(data)), keyboard_for(data))
+        apply_edit(chat_id, key, val)
+        return
+    if text == "/edit":
+        data = SESSIONS.get(chat_id)
+        if not data:
+            send(chat_id, "Сначала пришлите данные клиента.")
+        else:
+            send(chat_id, "Какое поле поправить?", fields_keyboard(data))
         return
 
     if len(text) < 15:
@@ -396,7 +511,7 @@ def handle_text(chat_id, user_id, text):
         fresh, _ = parse_client(text)
 
     data = merge_into_session(chat_id, fresh)
-    send(chat_id, render_reply(data, validate(data)), keyboard_for(data))
+    send(chat_id, render_reply(data, validate(data), chat_id=chat_id), keyboard_for(data))
 
 
 def handle_build(chat_id):
@@ -404,14 +519,14 @@ def handle_build(chat_id):
     if not data:
         send(chat_id, "Сначала пришлите данные клиента.")
         return
-    if not CAN_BUILD:
-        send(chat_id, f"Не найден шаблон: <code>{html.escape(TEMPLATE)}</code>")
+    if ensure_builder():
+        send(chat_id, "Договор собрать не могу: " + html.escape(BUILD_ERR))
         return
     errs = [i for i in validate(data) if i.level == "error"]
     if errs:
         send(chat_id, "Не формирую — сначала исправьте:\n" + "\n".join(
             f"• {html.escape(FIELD_LABELS.get(i.field, i.field))} — {html.escape(i.message)}"
-            for i in errs) + "\n\nИсправить: <code>/fix поле=значение</code>")
+            for i in errs) + "\n\nИсправить: «✏️ Редактировать».", keyboard_for(data))
         return
     send(chat_id, "Формирую договор…")
     try:
@@ -425,7 +540,48 @@ def handle_build(chat_id):
         send_file(chat_id, res["pdf"], caption)
     if res["warning"]:
         send(chat_id, html.escape(res["warning"]))
-    SESSIONS.pop(chat_id, None)
+    clear_session(chat_id)
+
+
+def handle_callback(chat_id, message_id, action):
+    data = SESSIONS.get(chat_id) or {}
+
+    if action == "build":
+        handle_build(chat_id)
+    elif action == "reset":
+        clear_session(chat_id)
+        send(chat_id, "Сброшено. Присылайте следующего клиента.")
+    elif action == "edit":
+        if not data:
+            send(chat_id, "Карточка клиента пуста — сначала пришлите данные.")
+            return
+        # кнопки под тем же сообщением меняются на список полей
+        edit_keyboard(chat_id, message_id, fields_keyboard(data))
+    elif action == "back":
+        EDITING.pop(chat_id, None)
+        edit_keyboard(chat_id, message_id, keyboard_for(data))
+    elif action.startswith("edit:"):
+        field = action[5:]
+        if field not in FIELDS or not data:
+            return
+        EDITING[chat_id] = field
+        cur = data.get(field) or ""
+        send(chat_id,
+             f"✏️ <b>{html.escape(FIELD_LABELS[field])}</b>\n"
+             "Сейчас: " + (f"<code>{html.escape(cur)}</code>" if cur else "—")
+             + "\n\nНапишите новое значение следующим сообщением.",
+             [[{"text": "🧹 Очистить поле", "callback_data": "clear:" + field}],
+              [{"text": "↩️ Отмена", "callback_data": "cancel"}]])
+    elif action.startswith("clear:"):
+        field = action[6:]
+        if field in FIELDS and data:
+            EDITING.pop(chat_id, None)
+            apply_edit(chat_id, field, "")
+    elif action == "cancel":
+        EDITING.pop(chat_id, None)
+        if data:
+            send(chat_id, "Без изменений.\n\n" + render_reply(data, validate(data), chat_id=chat_id),
+                 keyboard_for(data))
 
 
 def handle_update(upd):
@@ -436,12 +592,7 @@ def handle_update(upd):
         if CFG["allowed_ids"] and user_id not in CFG["allowed_ids"]:
             return
         api("answerCallbackQuery", callback_query_id=cb["id"])
-        if cb.get("data") == "build":
-            handle_build(chat_id)
-        elif cb.get("data") == "reset":
-            SESSIONS.pop(chat_id, None)
-            PHOTOBUF.pop(chat_id, None)
-            send(chat_id, "Сброшено.")
+        handle_callback(chat_id, cb["message"]["message_id"], cb.get("data") or "")
         return
 
     msg = upd.get("message") or upd.get("edited_message")
@@ -460,6 +611,13 @@ def handle_update(upd):
         return
 
     caption = msg.get("caption") or ""
+
+    # ждём новое значение поля после «✏️ Редактировать» → выбор поля.
+    # Команда или фото/файл вместо текста отменяют правку.
+    field = EDITING.pop(chat_id, None)
+    if field and msg.get("text") and not msg["text"].startswith("/"):
+        apply_edit(chat_id, field, msg["text"])
+        return
 
     # фото, сжатое телеграмом: берём самый крупный размер
     if msg.get("photo"):
@@ -504,8 +662,8 @@ def handle_update(upd):
         fresh, _ = parse_client(combined)
         if mrz_fields:
             fresh = apply_mrz(fresh, mrz_fields, page_text=combined)
-        data = merge_into_session(chat_id, fresh)
-        send(chat_id, render_reply(data, validate(data), html.escape(src))
+        data = merge_into_session(chat_id, fresh, from_passport=bool(mrz_fields))
+        send(chat_id, render_reply(data, validate(data), html.escape(src), chat_id)
              + "\n\nЧто было в файле: <code>/raw</code>", keyboard_for(data))
         return
 
@@ -528,8 +686,8 @@ def main():
         print("ИИ:", llm_provider.status()[1])
     except Exception as e:
         print("ИИ не настроен:", e)
-    if not CAN_BUILD:
-        print(f"Шаблон не найден ({TEMPLATE}) — кнопка «Сформировать договор» отключена.")
+    if BUILD_ERR:
+        print("ВНИМАНИЕ: договор не соберётся —", BUILD_ERR)
 
     offset = None
     while True:
