@@ -1,0 +1,8 @@
+bot_config.json
+llm_config.json
+counter.json
+counter.json.tmp
+*.csv
+11 Договоры Word/
+11 Договоры PDF/
+__pycache__/
