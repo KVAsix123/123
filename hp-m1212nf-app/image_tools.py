@@ -12,7 +12,7 @@ import io
 import os
 from dataclasses import dataclass
 
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageFilter
 
 
 @dataclass(frozen=True)
@@ -22,13 +22,16 @@ class Preset:
     mode: str  # "bw" | "gray" | "color"
     quality: int  # качество JPEG (для "bw" не используется)
     clean_background: bool
+    autocrop: bool = False
 
 
 PRESETS: dict[str, Preset] = {
-    "text_bw": Preset("Текстовый документ (Ч/Б, минимальный размер)", 300, "bw", 0, True),
+    "text_bw": Preset("Текст, Ч/Б — минимальный размер", 300, "bw", 0, True),
     "doc_gray": Preset("Документ в оттенках серого", 300, "gray", 75, True),
     "doc_color": Preset("Цветной документ", 300, "color", 75, True),
-    "photo": Preset("Фото (высокое качество)", 600, "color", 90, False),
+    # Защитный фон паспорта не «отбеливаем» — копия должна выглядеть как оригинал.
+    "id_doc": Preset("Паспорт / удостоверение", 300, "color", 85, False, True),
+    "photo": Preset("Фото — высокое качество", 600, "color", 90, False),
 }
 DEFAULT_PRESET = "doc_gray"
 
@@ -183,11 +186,75 @@ def rotate(img: Image.Image, degrees: int) -> Image.Image:
 
 
 def autocrop_to_content(img: Image.Image, margin_px: int = 0) -> Image.Image:
-    """Обрезает пустые белые поля (полезно при сканировании мелких документов/фото)."""
-    inv = ImageOps.invert(img.convert("L")).point(lambda v: 255 if v > 30 else 0)
-    box = inv.getbbox()
+    """Обрезает пустое поле стекла вокруг документа (паспорт, карточка, фото).
+
+    Документ ищется как область, отличающаяся по цвету от крышки сканера,
+    а не как «тёмные» пиксели: страницы паспорта бледно-пастельные и почти
+    такие же светлые, как крышка. Поиск идёт по уменьшенной копии
+    с медианным фильтром, чтобы шум и пылинки не расширяли рамку.
+    """
+    k = 4
+    small = img.convert("RGB").reduce(k).filter(ImageFilter.MedianFilter(5))
+    sw, sh = small.size
+    band = max(min(sw, sh) // 40, 2)
+    # Цвет крышки — самая светлая из четырёх краевых полос (документ обычно
+    # кладут в угол, поэтому часть полос может быть занята им).
+    strips = [small.crop(b) for b in ((0, 0, sw, band), (0, sh - band, sw, sh),
+                                      (0, 0, band, sh), (sw - band, 0, sw, sh))]
+    medians = [tuple(sorted(ch.getdata())[len(ch.getdata()) // 2] for ch in st.split()) for st in strips]
+    lid = max(medians, key=sum)
+    diff = ImageChops.difference(small, Image.new("RGB", small.size, lid))
+    r, g, b = diff.split()
+    mask = ImageChops.lighter(ImageChops.lighter(r, g), b).point(lambda v: 255 if v > 12 else 0)
+    # Узкую полосу у самого края стекла игнорируем — там бывает тень от рамки.
+    edge = max(min(sw, sh) // 200, 1)
+    inner = Image.new("L", small.size, 0)
+    inner.paste(mask.crop((edge, edge, sw - edge, sh - edge)), (edge, edge))
+    box = inner.getbbox()
     if not box:
         return img
-    l, t, r, b = box
+    l, t, rr, bb = (v * k for v in box)
+    if (rr - l) * (bb - t) < 0.02 * img.width * img.height:
+        return img  # нашли только пылинку — не обрезаем
     return img.crop((max(l - margin_px, 0), max(t - margin_px, 0),
-                     min(r + margin_px, img.width), min(b + margin_px, img.height)))
+                     min(rr + margin_px, img.width), min(bb + margin_px, img.height)))
+
+
+A4_INCHES = (8.27, 11.69)
+
+
+def compose_on_a4(items: list[tuple[Image.Image, int]], margin_in: float = 0.4) -> tuple[Image.Image, int]:
+    """Раскладывает 1–2 скана на один лист A4 сверху вниз (как ксерокопия паспорта).
+
+    Каждый скан сохраняет реальный физический размер, если помещается в свою
+    половину листа, иначе пропорционально уменьшается. Возвращает (лист, dpi).
+    """
+    dpi = max(d for _, d in items)
+    w, h = int(A4_INCHES[0] * dpi), int(A4_INCHES[1] * dpi)
+    modes = {img.mode for img, _ in items}
+    mode = "RGB" if "RGB" in modes else "L"
+    sheet = Image.new(mode, (w, h), "white")
+    margin = int(margin_in * dpi)
+    slot_h = (h - margin * (len(items) + 1)) // len(items)
+    slot_w = w - 2 * margin
+    for n, (img, d) in enumerate(items):
+        k = dpi / d  # приводим к общему dpi — физический размер не меняется
+        iw, ih = img.width * k, img.height * k
+        k2 = min(1.0, slot_w / iw, slot_h / ih)
+        size = (max(1, int(iw * k2)), max(1, int(ih * k2)))
+        part = img.convert(mode).resize(size, Image.LANCZOS)
+        x = (w - size[0]) // 2
+        y = margin + n * (slot_h + margin) + (slot_h - size[1]) // 2
+        sheet.paste(part, (x, y))
+    if modes == {"1"}:
+        sheet = sheet.point([255 if v > 127 else 0 for v in range(256)], "1")
+    return sheet, dpi
+
+
+def as_saved(img: Image.Image, quality: int, dpi: int) -> tuple[Image.Image, int]:
+    """Возвращает страницу ровно такой, какой она будет в файле (с артефактами
+    сжатия), и её размер в байтах — для честного предпросмотра."""
+    data, _ = encode_page(img, quality, dpi)
+    out = Image.open(io.BytesIO(data))
+    out.load()
+    return out, len(data)
