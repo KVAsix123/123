@@ -65,6 +65,46 @@ class ImageToolsTest(unittest.TestCase):
                 self.assertEqual(im.n_frames, 2)
 
 
+def fake_passport_on_bed(dpi=150):
+    """Бледный разворот паспорта 176×125 мм, прижатый к углу стекла A4."""
+    bed = Image.new("RGB", (int(8.27 * dpi), int(11.69 * dpi)), (247, 247, 245))
+    pw, ph = int(176 / 25.4 * dpi), int(125 / 25.4 * dpi)
+    doc = Image.new("RGB", (pw, ph), (228, 233, 218))  # пастельный фон, почти как крышка
+    ImageDraw.Draw(doc).text((pw // 2, ph // 2), "MVD", fill=(60, 60, 140))
+    bed.paste(doc, (0, 0))
+    noise = Image.effect_noise(bed.size, 25).convert("RGB")
+    return Image.blend(bed, noise, 0.06), (pw, ph)
+
+
+class LayoutTest(unittest.TestCase):
+    def test_autocrop_finds_pale_document_in_corner(self):
+        bed, (pw, ph) = fake_passport_on_bed()
+        out = it.autocrop_to_content(bed)
+        self.assertAlmostEqual(out.width, pw, delta=pw * 0.03)
+        self.assertAlmostEqual(out.height, ph, delta=ph * 0.03)
+
+    def test_autocrop_keeps_blank_page(self):
+        blank = Image.new("RGB", (600, 800), (247, 247, 245))
+        self.assertEqual(it.autocrop_to_content(blank).size, blank.size)
+
+    def test_compose_on_a4_keeps_real_size(self):
+        dpi = 150
+        spread = Image.new("RGB", (int(176 / 25.4 * dpi), int(125 / 25.4 * dpi)), "pink")
+        sheet, out_dpi = it.compose_on_a4([(spread, dpi), (spread.copy(), dpi)])
+        self.assertEqual(out_dpi, dpi)
+        self.assertEqual(sheet.size, (int(8.27 * dpi), int(11.69 * dpi)))
+        # Ширина розовой области на листе — те же 176 мм, что у оригинала.
+        row = [sheet.getpixel((x, int(sheet.height * 0.25))) for x in range(sheet.width)]
+        pink = sum(1 for px in row if px != (255, 255, 255))
+        self.assertAlmostEqual(pink / dpi * 25.4, 176, delta=2)
+
+    def test_as_saved_matches_encoded_size(self):
+        img = it.process(fake_scan(), "gray", True)
+        saved, size = it.as_saved(img, 60, 150)
+        self.assertEqual(saved.size, img.size)
+        self.assertEqual(size, len(it.encode_page(img, 60, 150)[0]))
+
+
 class PrintPlanTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
